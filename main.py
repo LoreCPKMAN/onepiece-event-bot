@@ -1,9 +1,21 @@
 """
 One Piece Card Game – Event Monitor Bot
-Two-level scraping:
-  Level 1 – main /events/ page → period sub-pages
-  Level 2 – each period page → individual keyword-matching events
-Sends Telegram notifications for new periods and new events.
+
+Two-level architecture:
+
+  Level 1 – main /events/ page
+    Finds "period" pages whose name or URL contains a keyword
+    (e.g. "Championship 26-27 Regionals Season 2", "Treasure Cup August 2026").
+    Notifies when a NEW period page is discovered.
+
+  Level 2 – each period page (e.g. regional-season2-26-27.html)
+    Parses individual events structured as:
+      <h5>Organizer Name</h5>
+      <dl><dd>Date: …  Venue: …  Link: <a href="…">Registration</a></dd></dl>
+    Sends two types of notification per event:
+      • "EVENT ANNOUNCED" – when the event first appears (even if registration is TBA)
+      • "REGISTRATION OPEN" – when a registration link becomes available for a
+        previously TBA event (second notification for the same event)
 """
 
 import asyncio
@@ -28,6 +40,12 @@ SEEN_FILE = "seen_events.json"
 
 KEYWORDS = ["regional", "treasure cup"]
 
+# Region header labels used inside period pages (h5 headings to skip)
+REGION_LABELS = {
+    "north america", "europe", "oceania", "latin america",
+    "asia", "asia pacific", "middle east",
+}
+
 REQUEST_TIMEOUT = 20
 HEADERS = {
     "User-Agent": (
@@ -46,24 +64,33 @@ log = logging.getLogger(__name__)
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
+# seen_events.json structure:
+# {
+#   "periods":   [...],   # URLs of period pages we've notified about
+#   "announced": [...],   # "period_url|region|organizer|date" – event announced
+#   "reg_open":  [...],   # registration link URLs – registration-open notified
+# }
 def load_seen() -> dict:
-    """Returns {"periods": set, "events": set}. Migrates old list format."""
+    """Load seen data; migrate from old flat-list format if necessary."""
     try:
         with open(SEEN_FILE) as f:
             data = json.load(f)
         if isinstance(data, dict):
             return {
                 "periods": set(data.get("periods", [])),
-                "events": set(data.get("events", [])),
+                "announced": set(data.get("announced", [])),
+                "reg_open": set(data.get("reg_open", [])),
+                # legacy "events" key → fold into announced
+                **({} if "events" not in data else {"announced": set(data["events"])}),
             }
         if isinstance(data, list):
-            # Migrate from old format (flat list of event URLs)
-            return {"periods": set(), "events": set(data)}
+            # very old format: flat list of event URLs
+            return {"periods": set(), "announced": set(data), "reg_open": set()}
     except FileNotFoundError:
         pass
     except Exception as exc:
         log.error("Could not read %s: %s", SEEN_FILE, exc)
-    return {"periods": set(), "events": set()}
+    return {"periods": set(), "announced": set(), "reg_open": set()}
 
 
 def save_seen(seen: dict) -> None:
@@ -72,7 +99,8 @@ def save_seen(seen: dict) -> None:
             json.dump(
                 {
                     "periods": sorted(seen["periods"]),
-                    "events": sorted(seen["events"]),
+                    "announced": sorted(seen["announced"]),
+                    "reg_open": sorted(seen["reg_open"]),
                 },
                 f,
                 indent=2,
@@ -95,167 +123,125 @@ def fetch(url: str) -> BeautifulSoup | None:
 def abs_url(href: str) -> str:
     if href.startswith("http"):
         return href
-    if href.startswith("/"):
-        return BASE_URL + href
-    return BASE_URL + "/" + href
+    return BASE_URL + (href if href.startswith("/") else "/" + href)
 
 
-def _normalize_url(url: str) -> str:
-    """Strip trailing slash for consistent comparison."""
+def _normalize(url: str) -> str:
     return url.rstrip("/")
 
 
-# ── Text extraction helpers ───────────────────────────────────────────────────
-def _extract_name(anchor: BeautifulSoup) -> str:
-    heading = anchor.find(re.compile(r"^h[1-6]$"))
-    if heading:
-        return heading.get_text(" ", strip=True)
-    title_el = anchor.find(class_=re.compile(r"title|name|heading|label", re.I))
-    if title_el:
-        return title_el.get_text(" ", strip=True)
-    lines = [ln.strip() for ln in anchor.get_text("\n").splitlines() if ln.strip()]
-    return lines[0] if lines else ""
-
-
-def _extract_period(anchor: BeautifulSoup) -> str:
-    for node in anchor.find_all(string=True):
-        text = node.strip()
-        if re.search(r"[Ee]vent\s+[Pp]eriod", text):
-            return re.sub(r"^[Ee]vent\s+[Pp]eriod\s*[:\-]\s*", "", text).strip()
-    for node in anchor.find_all(string=True):
-        text = node.strip()
-        if re.search(r"\b20\d{2}\b", text) and len(text) < 80:
-            return text
-    return ""
-
-
-def _is_target(name: str) -> bool:
-    low = name.lower()
+def _has_keyword(text: str) -> bool:
+    low = text.lower()
     return any(kw in low for kw in KEYWORDS)
 
 
-def _is_internal_events_link(href: str) -> bool:
-    """True if the href points to a sub-page under /events/."""
-    return bool(re.search(r"/events/[^?#]+", href))
-
-
-# ── Level 1 – Discover period pages from the main events page ─────────────────
-def scrape_period_links() -> list[dict]:
+# ── Level 1 – Main page: discover period pages ────────────────────────────────
+def scrape_period_pages() -> list[dict]:
     """
-    Scrapes the main /events/ page and returns all sub-page links as period
-    candidates. No keyword filter – we want every period, not just matching ones.
+    Scrape the main /events/ page and return sub-pages that match a keyword
+    (in their anchor name or URL). These are the "period" pages to monitor.
     """
     soup = fetch(EVENTS_URL)
     if not soup:
         return []
 
     results: list[dict] = []
-    seen_hrefs: set[str] = set()
+    seen_urls: set[str] = set()
+    norm_events = _normalize(EVENTS_URL)
 
     for a in soup.find_all("a", href=True):
         href: str = a["href"].strip()
-        if not _is_internal_events_link(href):
+        if not re.search(r"/events/[^?#]+", href):
             continue
 
-        url = _normalize_url(abs_url(href))
-        norm_events = _normalize_url(EVENTS_URL)
-        if url == norm_events or url in seen_hrefs:
+        url = _normalize(abs_url(href))
+        if url == norm_events or url in seen_urls:
             continue
+        seen_urls.add(url)
 
-        name = _extract_name(a)
-        results.append({"name": name or url, "url": url})
-        seen_hrefs.add(url)
-        log.info("Period candidate: %s → %s", name or "(no name)", url)
+        # Extract the best name from the anchor card
+        heading = a.find(re.compile(r"^h[1-6]$"))
+        name = (
+            heading.get_text(" ", strip=True)
+            if heading
+            else (a.get_text(" ", strip=True).splitlines()[0].strip() if a.get_text(strip=True) else "")
+        )
 
-    log.info("Found %d period link(s) on main page", len(results))
+        is_keyword = _has_keyword(name) or _has_keyword(url)
+        results.append({"name": name or url, "url": url, "keyword": is_keyword})
+        log.info("Period page found%s: %s", " [keyword]" if is_keyword else "", name or url)
+
+    log.info("Found %d period page(s) on main page", len(results))
     return results
 
 
-# ── Level 2 – Scrape a period page for individual events ─────────────────────
-def scrape_period_for_events(period_url: str) -> list[dict]:
+# ── Level 2 – Period page: parse individual events ────────────────────────────
+def _parse_dd(dd_text: str, dl: BeautifulSoup) -> tuple[str, str, str]:
     """
-    Fetches a period page and returns keyword-matching event entries.
-    Looks for any anchor whose visible text matches KEYWORDS.
+    Extract (date, venue, registration_link) from a <dl><dd> block.
+    dd_text is the plain text; dl is the BeautifulSoup element for link extraction.
+    """
+    date_m = re.search(r"Date:\s*(.+?)(?:\s*Venue:|\s*Link:|$)", dd_text, re.S)
+    date = date_m.group(1).strip() if date_m else ""
+
+    venue_m = re.search(r"Venue:\s*(.+?)(?:\s*Link:|$)", dd_text, re.S)
+    venue = venue_m.group(1).strip() if venue_m else ""
+
+    reg_a = dl.find("a", href=True)
+    reg_link = abs_url(reg_a["href"]) if reg_a else ""
+
+    return date, venue, reg_link
+
+
+def scrape_individual_events(period_url: str) -> list[dict]:
+    """
+    Parse individual events from a period page.
+
+    Structure inside the page:
+      <h5>Region Label</h5>          ← skip these
+      <h5>Organizer Name</h5>
+      <dl><dd>Date: …  Venue: …  Link: <a href="…"/></dd></dl>
     """
     soup = fetch(period_url)
     if not soup:
         return []
 
     results: list[dict] = []
-    seen_hrefs: set[str] = set()
+    current_region = ""
 
-    for a in soup.find_all("a", href=True):
-        href: str = a["href"].strip()
-        if not href or href.startswith("#"):
+    for h5 in soup.find_all("h5"):
+        organizer = h5.get_text(strip=True)
+        if not organizer:
             continue
 
-        url = _normalize_url(abs_url(href))
-
-        # Skip links that go outside the site or back to the period page itself
-        if BASE_URL not in url or url == _normalize_url(period_url):
+        # Region header → just update current region
+        if organizer.lower() in REGION_LABELS:
+            current_region = organizer
             continue
 
-        if url in seen_hrefs:
+        # Must be followed by a <dl> to be an event entry
+        dl = h5.find_next_sibling("dl")
+        if not dl:
             continue
 
-        name = _extract_name(a)
-        if not name or not _is_target(name):
-            continue
+        dd_text = dl.get_text(" ", strip=True)
+        date, venue, reg_link = _parse_dd(dd_text, dl)
 
-        period_text = _extract_period(a)
-        results.append({"name": name, "url": url, "period": period_text})
-        seen_hrefs.add(url)
-        log.info("Event found in period page: %s", name)
+        # Stable announcement key (does not change when reg link is added later)
+        announce_key = f"{period_url}|{current_region}|{organizer}|{date}"
 
-    log.info("Period %s → %d keyword event(s)", period_url, len(results))
+        results.append({
+            "organizer": organizer,
+            "region": current_region,
+            "date": date,
+            "venue": venue,
+            "registration_link": reg_link,
+            "announce_key": announce_key,
+            "period_url": period_url,
+        })
+
+    log.info("Period %s → %d individual event(s) parsed", period_url, len(results))
     return results
-
-
-# ── Level 3 – Event detail page scraping ─────────────────────────────────────
-def scrape_detail(url: str) -> dict:
-    soup = fetch(url)
-    if not soup:
-        return {}
-
-    detail: dict = {}
-
-    # Search by href pattern
-    reg = soup.find("a", href=re.compile(r"register|apply|application|signup|sign.up|entry|entries", re.I))
-    # Fallback: search by visible link text
-    if not reg:
-        reg_text_pattern = re.compile(r"register|apply|sign.up|entry|entries|how to enter", re.I)
-        reg = next(
-            (a for a in soup.find_all("a", href=True) if reg_text_pattern.search(a.get_text())),
-            None,
-        )
-    if reg and reg.get("href"):
-        detail["registration_link"] = abs_url(reg["href"])
-
-    locations: list[str] = []
-    region_pattern = re.compile(
-        r"north\s+america|europe|oceania|latin\s+america|asia|japan", re.I
-    )
-    for heading in soup.find_all(re.compile(r"^h[1-6]$")):
-        if not region_pattern.search(heading.get_text()):
-            continue
-        sibling = heading.find_next_sibling()
-        while sibling and sibling.name not in ("h1", "h2", "h3", "h4"):
-            for td in sibling.find_all(["td", "li"]):
-                text = td.get_text(strip=True)
-                if 3 < len(text) < 60 and not re.match(r"^(regulation|standard|deck)", text, re.I):
-                    locations.append(text)
-            sibling = sibling.find_next_sibling()
-
-    if locations:
-        seen_loc: set[str] = set()
-        unique: list[str] = []
-        for loc in locations:
-            if loc not in seen_loc:
-                seen_loc.add(loc)
-                unique.append(loc)
-        detail["locations"] = unique[:6]
-
-    return detail
 
 
 # ── Telegram notifications ────────────────────────────────────────────────────
@@ -266,37 +252,46 @@ def _esc(text: str) -> str:
     return _MD2_SPECIAL.sub(r"\\\1", text)
 
 
-def build_event_message(event: dict, detail: dict) -> str:
-    name = event.get("name", "Unknown Event")
-    period = event.get("period", "")
-    url = event.get("url", "")
-    locations = detail.get("locations", [])
-    location_str = ", ".join(locations[:3]) if locations else "See link"
-    reg = detail.get("registration_link", "")
-
-    lines = [
-        "🏴‍☠️ *NEW EVENT DETECTED\\!*",
+def build_period_message(period: dict) -> str:
+    return "\n".join([
+        "📅 *NEW EVENT PAGE PUBLISHED\\!*",
         "",
-        f"📌 *Name:* {_esc(name)}",
-    ]
-    if period:
-        lines.append(f"📅 *Period:* {_esc(period)}")
-    lines.append(f"📍 *Location:* {_esc(location_str)}")
-    lines.append(f"🔗 *Info:* {_esc(url)}")
-    lines.append(f"📝 *Register:* {_esc(reg if reg else url)}")
+        f"📌 *Event:* {_esc(period['name'])}",
+        f"🔗 *Link:* {_esc(period['url'])}",
+    ])
 
+
+def build_announced_message(ev: dict) -> str:
+    reg = ev["registration_link"]
+    reg_line = f"📝 *Register:* {_esc(reg)}" if reg else f"📝 *Register:* TBA — check {_esc(ev['period_url'])}"
+    lines = [
+        "📋 *NEW EVENT ANNOUNCED\\!*",
+        "",
+        f"📌 *Organizer:* {_esc(ev['organizer'])}",
+    ]
+    if ev["region"]:
+        lines.append(f"🌍 *Region:* {_esc(ev['region'])}")
+    if ev["date"]:
+        lines.append(f"📅 *Date:* {_esc(ev['date'])}")
+    if ev["venue"]:
+        lines.append(f"📍 *Venue:* {_esc(ev['venue'])}")
+    lines.append(reg_line)
     return "\n".join(lines)
 
 
-def build_period_message(period: dict) -> str:
-    name = period.get("name", "New Event Period")
-    url = period.get("url", "")
+def build_reg_open_message(ev: dict) -> str:
     lines = [
-        "📅 *NEW EVENT PERIOD PUBLISHED\\!*",
+        "🏴‍☠️ *REGISTRATION NOW OPEN\\!*",
         "",
-        f"📌 *Period:* {_esc(name)}",
-        f"🔗 *Link:* {_esc(url)}",
+        f"📌 *Organizer:* {_esc(ev['organizer'])}",
     ]
+    if ev["region"]:
+        lines.append(f"🌍 *Region:* {_esc(ev['region'])}")
+    if ev["date"]:
+        lines.append(f"📅 *Date:* {_esc(ev['date'])}")
+    if ev["venue"]:
+        lines.append(f"📍 *Venue:* {_esc(ev['venue'])}")
+    lines.append(f"📝 *Register:* {_esc(ev['registration_link'])}")
     return "\n".join(lines)
 
 
@@ -308,9 +303,9 @@ async def _send(bot: Bot, text: str, label: str) -> None:
             parse_mode="MarkdownV2",
             disable_web_page_preview=False,
         )
-        log.info("Notification sent: %s", label)
+        log.info("Sent: %s", label)
     except TelegramError as exc:
-        log.error("Telegram send failed for '%s': %s", label, exc)
+        log.error("Telegram error for '%s': %s", label, exc)
 
 
 # ── Scheduled job ─────────────────────────────────────────────────────────────
@@ -318,35 +313,41 @@ async def check_events(bot: Bot) -> None:
     log.info("--- Event check started ---")
     seen = load_seen()
 
-    # Level 1: find period pages on the main events page
-    period_candidates = scrape_period_links()
-    if not period_candidates:
-        log.info("No period links found on main page")
+    period_pages = scrape_period_pages()
+    if not period_pages:
+        log.info("No period pages found on main page")
         return
 
-    for period in period_candidates:
+    for period in period_pages:
         period_url = period["url"]
-        is_new_period = period_url not in seen["periods"]
 
-        if is_new_period:
-            log.info("New period discovered: %s", period_url)
+        # Notify if this is a newly discovered period page
+        if period_url not in seen["periods"]:
+            log.info("New period page: %s", period_url)
             await _send(bot, build_period_message(period), f"period: {period['name']}")
             seen["periods"].add(period_url)
 
-        # Level 2: scrape this period page for keyword-matching events
-        events = scrape_period_for_events(period_url)
-        new_events = [e for e in events if e["url"] not in seen["events"]]
-
-        if not new_events:
-            log.info("No new events in period: %s", period_url)
+        # Deep-scrape individual events only for keyword pages (Regional / Treasure Cup)
+        if not period.get("keyword"):
             continue
 
-        log.info("%d new event(s) in period %s", len(new_events), period_url)
-        for event in new_events:
-            log.info("Fetching detail page: %s", event["url"])
-            detail = scrape_detail(event["url"])
-            await _send(bot, build_event_message(event, detail), event["name"])
-            seen["events"].add(event["url"])
+        events = scrape_individual_events(period_url)
+        for ev in events:
+            # 1. New event announced (first time we see it, even if TBA)
+            if ev["announce_key"] not in seen["announced"]:
+                label = f"announced: {ev['organizer']} ({ev['region']})"
+                await _send(bot, build_announced_message(ev), label)
+                seen["announced"].add(ev["announce_key"])
+
+            # 2. Registration just opened for a previously TBA event
+            elif ev["registration_link"] and ev["registration_link"] not in seen["reg_open"]:
+                label = f"reg open: {ev['organizer']} ({ev['region']})"
+                await _send(bot, build_reg_open_message(ev), label)
+                seen["reg_open"].add(ev["registration_link"])
+
+            # Mark registration as seen even on first announcement
+            if ev["registration_link"]:
+                seen["reg_open"].add(ev["registration_link"])
 
     save_seen(seen)
     log.info("--- Event check complete ---")
