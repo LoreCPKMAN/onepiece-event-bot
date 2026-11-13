@@ -41,7 +41,7 @@ import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup, Tag
 from telegram import Bot
-from telegram.error import RetryAfter, TelegramError, TimedOut
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.request import HTTPXRequest
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -428,7 +428,17 @@ async def main() -> None:
         token=BOT_TOKEN,
         request=HTTPXRequest(connect_timeout=10, read_timeout=20, write_timeout=20),
     )
-    await bot.initialize()
+    # Right after a container starts the network may not be ready yet: retry instead
+    # of crashing on the very first request.
+    for attempt in range(1, 6):
+        try:
+            await bot.initialize()
+            break
+        except NetworkError as exc:
+            if attempt == 5:
+                raise
+            log.warning("Telegram not reachable yet (%s), retrying in %ds", exc, attempt * 5)
+            await asyncio.sleep(attempt * 5)
     log.info("One Piece Event Bot starting up (state file: %s)", SEEN_FILE)
 
     scheduler = AsyncIOScheduler(timezone="UTC")
