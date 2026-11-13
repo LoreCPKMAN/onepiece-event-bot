@@ -79,10 +79,17 @@ On first run the bot immediately performs one check, then repeats every hour.
    |-----|-------|
    | `TELEGRAM_BOT_TOKEN` | your bot token |
    | `TELEGRAM_CHAT_ID` | your group chat ID |
-4. Railway auto-detects the `Procfile` and runs the `worker` process.
-5. The bot starts, performs an immediate check, and then runs hourly.
+4. **Attach a Volume** to the service (right-click the service → *Attach Volume*, mount path e.g. `/data`).
+   Railway exposes it as `RAILWAY_VOLUME_MOUNT_PATH` and the bot stores `seen_events.json` there automatically.
+   Without a volume the file is wiped on every restart.
+5. Railway auto-detects the `Procfile` and runs the `worker` process; `railway.json` sets the restart policy to `ALWAYS`.
+6. The bot starts, performs an immediate check, and then runs hourly.
 
-> **Tip:** Railway's free tier sleeps after inactivity. Use a paid plan or the always-on option to keep the worker alive 24/7.
+> **Serverless / App Sleeping:** Railway sleeps a service after 10 minutes without outbound traffic, and a worker
+> is never woken up again. The bot sends a lightweight keep-alive request to the Telegram API every 4 minutes to stay awake.
+>
+> **First run:** when no `seen_events.json` exists, the bot records every event already on the site *without* notifying,
+> then sends a single "Bot avviato" summary. If you see that summary after every restart, the volume is not attached correctly.
 
 ---
 
